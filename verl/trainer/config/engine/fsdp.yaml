@@ -123,3 +123,5 @@ turbo_config:
       fsdp_implementation: native
       num_to_forward_prefetch: 1
       num_to_backward_prefetch: 1
+
+forward_only_cpu_offload: true

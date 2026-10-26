@@ -120,3 +120,7 @@ apply_chat_template_kwargs: {}
 
 # Additional kwargs passed to multimodal processors/backends.
 mm_processor_kwargs: {}
+
+# Explicit chat protocol for distilled checkpoints with a different model_type.
+continuous_token:
+  model_family: auto

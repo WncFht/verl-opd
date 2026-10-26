@@ -158,7 +158,11 @@ def _find_meta(*args, **kwargs):
 
 
 async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
+    sample_keys = None
+    sample_partition = None
     if isinstance(meta, KVBatchMeta):
+        if meta.extra_info.get("retain_sample_identity", False):
+            sample_keys, sample_partition = list(meta.keys), meta.partition_id
         meta = await async_kv_batch_meta2batch_meta(meta)
     meta_info = copy.deepcopy(meta.extra_info)
     if meta.size == 0:
@@ -167,7 +171,18 @@ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
         return empty_td
 
     tq_client = tq.get_client()
+    if sample_keys is None and meta_info.get("retain_sample_identity", False):
+        # DP dispatch may already have converted KVBatchMeta into an index-based BatchMeta.
+        sample_partition = meta.partition_ids[0]
+        if any(pid != sample_partition for pid in meta.partition_ids):
+            raise ValueError("retained sample identity requires a single TQ partition")
+        sample_keys = await tq_client.async_kv_retrieve_keys(
+            global_indexes=meta.global_indexes, partition_id=sample_partition
+        )
     tensordict = await tq_client.async_get_data(meta)
+    if sample_keys is not None:
+        tensordict["sample_keys"] = NonTensorStack(*sample_keys)
+        tu.assign_non_tensor_data(tensordict, "sample_partition", sample_partition)
 
     for key, val in meta_info.items():
         if isinstance(val, (NonTensorData | NonTensorStack)):

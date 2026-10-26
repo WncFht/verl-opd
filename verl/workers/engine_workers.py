@@ -226,7 +226,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
         loss = torch.sum(torch.tensor(output.pop("loss"), device=self.device_name))
         dp_group = self.engine.get_data_parallel_group()
         if dp_group is not None:
-            torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_group)
+            torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+            loss /= torch.distributed.get_world_size(dp_group)
         loss = loss.item()
 
         # For grad_norm, we do not perform all reduce because it is already been done when clipping grad
@@ -684,7 +685,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 self.loss_fn = partial(ppo_loss, config=actor_config)
             self.actor = self.actor_worker_cls(config=actor_training_config)
+            full_vocab = (
+                self.distillation_enabled
+                and distillation_config.distillation_loss.loss_settings.payload_kind == "hidden"
+            )
+            if full_vocab:
+                object.__setattr__(actor_training_config.model_config, "enable_full_vocab", True)
             self.actor.reset()
+            if full_vocab:
+                self.actor.engine.configure_full_vocab(
+                    distillation_config.distillation_loss.full_vocab,
+                    next(iter(distillation_config.teacher_models.values())).model_path,
+                )
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
@@ -753,7 +765,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update", scheduled=True)
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
-        output = self.actor.train_mini_batch(data=data)
+        try:
+            output = self.actor.train_mini_batch(data=data)
+        finally:
+            head = getattr(self.actor.engine, "full_vocab_teacher_head", None)
+            if head is not None:
+                head.release()
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

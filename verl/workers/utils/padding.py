@@ -20,6 +20,26 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.attention_utils import index_first_axis, unpad_input
 
 
+def prediction_positions(input_ids, loss_mask):
+    """Per-sample positions predicting the masked response, then packed positions.
+
+    loss_mask uses the response layout, including masked tool-result positions.
+    A full-sequence mask is also accepted if its first target is masked out.
+    """
+    positions, packed = [], []
+    offset = 0
+    for ids, mask in zip(input_ids.unbind(), loss_mask.unbind(), strict=True):
+        if mask.ndim != 1 or len(mask) > len(ids) or not torch.all((mask == 0) | (mask == 1)):
+            raise ValueError("loss_mask must be a binary response/full-sequence mask")
+        local = mask.bool().nonzero().flatten() + len(ids) - len(mask) - 1
+        if local.numel() and (local.min() < 0 or local.max() >= len(ids) - 1):
+            raise ValueError("A valid next-token target must have a preceding input position")
+        positions.append(local)
+        packed.append(local + offset)
+        offset += len(ids)
+    return positions, torch.cat(packed)
+
+
 def left_right_2_no_padding(data: TensorDict) -> TensorDict:
     """
     Convert TensorDict from left-right padding to no-padding format.

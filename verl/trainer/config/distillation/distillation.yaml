@@ -13,6 +13,25 @@ defaults:
 # Whether to enable distillation.
 enabled: false
 
+# Shared FSDP scoring is opt-in; existing standalone teachers retain their behavior.
+execution_mode: standalone
+
+# Frozen FSDP2 teacher on the actor pool. No separate inference servers.
+shared_teacher:
+  _target_: verl.workers.config.FSDPEngineConfig
+  strategy: fsdp2
+  forward_only: true
+  model_dtype: bfloat16
+  mixed_precision: null
+  param_offload: true
+  optimizer_offload: false
+  offload_policy: false
+  forward_only_cpu_offload: false
+  reshard_after_forward: true
+  use_dynamic_bsz: true
+  infer_max_token_len_per_gpu: 32768
+  use_torch_compile: false
+
 # distillation loss config
 distillation_loss:
 
@@ -22,6 +41,11 @@ distillation_loss:
 
   # Loss function mode for distillation
   loss_mode: k3
+  full_vocab:
+    _target_: verl.workers.config.distillation.FullVocabConfig
+    token_chunk_size: 512
+    async_write: false
+    prefetch: false
 
   # If distillation loss requires top-k logits, this is the value of k
   topk: 32

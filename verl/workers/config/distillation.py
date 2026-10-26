@@ -17,15 +17,31 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 
+from omegaconf import OmegaConf
+
 from verl.base_config import BaseConfig
 from verl.utils.config import omega_conf_to_dataclass
 
+from .engine import FSDPEngineConfig
 from .rollout import RolloutConfig
 
 __all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+@dataclass
+class FullVocabConfig(BaseConfig):
+    """Bounded token blocks and hidden transport for exact reverse KL."""
+
+    token_chunk_size: int = 512
+    async_write: bool = False
+    prefetch: bool = False
+
+    def __post_init__(self):
+        if type(self.token_chunk_size) is not int or self.token_chunk_size <= 0:
+            raise ValueError("full_vocab.token_chunk_size must be a positive integer")
 
 
 @dataclass
@@ -63,6 +79,7 @@ class DistillationLossConfig(BaseConfig):
     """
 
     loss_mode: str = "k3"
+    full_vocab: FullVocabConfig = field(default_factory=FullVocabConfig)
     topk: Optional[int] = 128
     use_task_rewards: bool = True
     distillation_loss_coef: float = 1.0
@@ -95,13 +112,21 @@ class DistillationLossConfig(BaseConfig):
 
     # Store distillation loss settings for computing the specified loss_mode
     # Not set by user, populated at runtime
-    loss_settings: Optional[dict] = None
+    loss_settings: Optional[dict] = field(default=None, metadata={"omegaconf_ignore": True})
 
     def __post_init__(self):
         self._mutable_fields.add("loss_settings")
-        from verl.trainer.distillation.losses import DistillationLossSettings, get_distillation_loss_settings
+        from verl.workers.config.distillation_spec import DistillationLossSettings, get_distillation_loss_settings
 
         self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
+
+        if isinstance(self.full_vocab, dict):
+            object.__setattr__(self, "full_vocab", FullVocabConfig(**self.full_vocab))
+        if self.loss_mode == "full_reverse_kl":
+            if self.use_policy_gradient or self.use_task_rewards or self.policy_loss_mode != "vanilla":
+                raise ValueError("full_reverse_kl requires direct loss without task rewards or sampled PG")
+            if self.loss_max_clamp is not None or self.log_prob_min_clamp is not None:
+                raise ValueError("full_reverse_kl requires unclamped loss and log probabilities")
 
         if self.policy_loss_mode != "vanilla":
             raise NotImplementedError(
@@ -260,6 +285,18 @@ class DistillationConfig(BaseConfig):
     _mutable_fields = BaseConfig._mutable_fields | {"teacher_models", "n_gpus_per_node", "nnodes"}
 
     enabled: bool = False
+    execution_mode: str = "standalone"
+    shared_teacher: FSDPEngineConfig = field(
+        default_factory=lambda: FSDPEngineConfig(
+            strategy="fsdp2",
+            forward_only=True,
+            model_dtype="bfloat16",
+            param_offload=True,
+            forward_only_cpu_offload=False,
+            infer_max_token_len_per_gpu=32768,
+            use_torch_compile=False,
+        )
+    )
     n_gpus_per_node: int = 0
     nnodes: int = 0
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
@@ -267,10 +304,45 @@ class DistillationConfig(BaseConfig):
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
 
     def __post_init__(self):
+        if self.execution_mode not in ("standalone", "shared_sync"):
+            raise ValueError(f"Unknown distillation.execution_mode: {self.execution_mode}")
         if not self.enabled:
             return
 
+        if self.execution_mode == "shared_sync":
+            if len(self.teacher_models) != 1 or "teacher_model" not in self.teacher_models:
+                raise ValueError("shared_sync requires exactly one teacher_models.teacher_model")
+            if self.n_gpus_per_node != 0 or self.nnodes != 0:
+                raise ValueError("shared_sync requires distillation.n_gpus_per_node=0 and nnodes=0")
+            loss = self.distillation_loss
+            if loss.loss_mode != "full_reverse_kl" and (
+                loss.loss_mode != "k1" or not loss.use_policy_gradient or loss.use_task_rewards
+            ):
+                raise ValueError("shared_sync currently requires k1 + policy gradient without task rewards")
+            engine = self.shared_teacher
+            required = {
+                "strategy": "fsdp2",
+                "forward_only": True,
+                "param_offload": True,
+                "optimizer_offload": False,
+                "offload_policy": False,
+                "forward_only_cpu_offload": False,
+                "reshard_after_forward": True,
+                "ulysses_sequence_parallel_size": 1,
+                "use_dynamic_bsz": True,
+                "use_fused_kernels": False,
+                "use_remove_padding": True,
+            }
+            for name, value in required.items():
+                if getattr(engine, name) != value:
+                    raise ValueError(f"shared_sync requires shared_teacher.{name}={value}")
+            if engine.qat.enable or not engine.infer_max_token_len_per_gpu or engine.infer_max_token_len_per_gpu < 1:
+                raise ValueError("shared_sync requires a positive teacher token budget and no QAT")
         self.teacher_models = self._resolve_teacher_models()
+        if self.distillation_loss.loss_mode == "full_reverse_kl" and self.execution_mode != "shared_sync":
+            raise ValueError("full_reverse_kl currently requires shared_sync")
+        if self.execution_mode == "shared_sync":
+            return
         teacher_world_size_sum = 0
         for teacher_model in self.teacher_models.values():
             teacher_model.validate_and_prepare_for_distillation(
@@ -291,19 +363,22 @@ class DistillationConfig(BaseConfig):
         if len(self.teacher_models) == 1:
             # Single teacher occupies the entire teacher resource pool.
             teacher_model = self.teacher_models["teacher_model"]
-            inference = teacher_model.inference
-            per_replica = (
-                inference.tensor_model_parallel_size
-                * inference.data_parallel_size
-                * inference.pipeline_model_parallel_size
-            )
-            pool_size = self.n_gpus_per_node * self.nnodes
-            if pool_size % per_replica != 0:
-                raise ValueError(
-                    f"Single teacher's per_replica_world_size ({per_replica}) must divide the distillation "
-                    f"resource pool size ({self.n_gpus_per_node=} * {self.nnodes=} = {pool_size})."
+            if self.execution_mode == "shared_sync":
+                teacher_model.num_replicas = 0  # No teacher inference servers.
+            else:
+                inference = teacher_model.inference
+                per_replica = (
+                    inference.tensor_model_parallel_size
+                    * inference.data_parallel_size
+                    * inference.pipeline_model_parallel_size
                 )
-            teacher_model.num_replicas = pool_size // per_replica
+                pool_size = self.n_gpus_per_node * self.nnodes
+                if pool_size % per_replica != 0:
+                    raise ValueError(
+                        f"Single teacher's per_replica_world_size ({per_replica}) must divide the distillation "
+                        f"resource pool size ({self.n_gpus_per_node=} * {self.nnodes=} = {pool_size})."
+                    )
+                teacher_model.num_replicas = pool_size // per_replica
             teacher_model.key = "default"
         else:
             # Multiple teachers: remove default single teacher config
@@ -318,3 +393,61 @@ class DistillationConfig(BaseConfig):
                 raise ValueError(f"Duplicate teacher key {teacher_config.key} found in teacher models.")
             teacher_models[teacher_config.key] = teacher_config
         return teacher_models
+
+    def validate_shared_sync(self, config, *, use_reference_policy=False, use_critic=False):
+        """Reject unsupported shared lifecycles before creating Ray workers."""
+        if not self.enabled or self.execution_mode != "shared_sync":
+            return
+        required = {
+            "trainer.use_v1": True,
+            "trainer.nnodes": 1,
+            "trainer.v1.trainer_mode": "sync",
+            "trainer.v1.sync.parameter_sync_step": 1,
+            "actor_rollout_ref.hybrid_engine": True,
+            "actor_rollout_ref.actor.strategy": "fsdp2",
+            "actor_rollout_ref.actor.fsdp_config.param_offload": True,
+            "actor_rollout_ref.actor.fsdp_config.optimizer_offload": True,
+            "actor_rollout_ref.actor.fsdp_config.offload_policy": False,
+            "actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size": 1,
+            "actor_rollout_ref.actor.ulysses_sequence_parallel_size": 1,
+            "actor_rollout_ref.model.use_remove_padding": True,
+            "actor_rollout_ref.model.use_fused_kernels": False,
+            "actor_rollout_ref.rollout.name": "vllm",
+            "actor_rollout_ref.rollout.free_cache_engine": True,
+            "actor_rollout_ref.rollout.tensor_model_parallel_size": 1,
+            "actor_rollout_ref.rollout.data_parallel_size": 1,
+            "actor_rollout_ref.rollout.pipeline_model_parallel_size": 1,
+            "actor_rollout_ref.rollout.agent.default_agent_loop": "single_turn_agent",
+        }
+        for path, expected in required.items():
+            if OmegaConf.select(config, path, default=expected) != expected:
+                raise ValueError(f"shared_sync requires {path}={expected}")
+        disabled = (
+            "reward.reward_model.enable",
+            "reward.reward_model.enable_resource_pool",
+            "algorithm.filter_groups.enable",
+            "skip.rollout_tq.enable",
+            "skip.rollout.enable",
+            "actor_rollout_ref.model.lora.rank",
+            "actor_rollout_ref.model.lora_rank",
+            "actor_rollout_ref.model.lora_adapter_path",
+            "actor_rollout_ref.model.mtp.enable",
+            "actor_rollout_ref.actor.fsdp_config.qat.enable",
+            "actor_rollout_ref.rollout.multi_turn.enable",
+            "actor_rollout_ref.rollout.topk_log_probs",
+            "actor_rollout_ref.rollout.agent.agent_loop_manager_class",
+            "actor_rollout_ref.rollout.agent.agent_loop_config_path",
+            "trainer.v1.sampler.custom_sampler.path",
+            "trainer.v1.sampler.custom_sampler.name",
+        )
+        for path in disabled:
+            if OmegaConf.select(config, path, default=None):
+                raise ValueError(f"shared_sync does not support {path}")
+        if use_reference_policy or use_critic:
+            raise ValueError("shared_sync does not support reference or critic workers")
+        world_size = config.trainer.n_gpus_per_node
+        if world_size < 1 or self.shared_teacher.fsdp_size not in (-1, world_size):
+            raise ValueError("shared teacher fsdp_size must match the actor world size (or be -1)")
+        max_length = config.data.max_prompt_length + config.data.max_response_length
+        if self.shared_teacher.infer_max_token_len_per_gpu < max_length:
+            raise ValueError("shared teacher token budget must hold a complete training sequence")

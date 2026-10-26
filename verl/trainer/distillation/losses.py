@@ -12,16 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 import torch
 from tensordict import TensorDict
 
-from verl.base_config import BaseConfig
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.metric import AggregationType, Metric
 from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
+from verl.workers.config.distillation_spec import (
+    DISTILLATION_SETTINGS_REGISTRY,
+    DistillationLossSettings,
+)
+from verl.workers.config.distillation_spec import (
+    get_distillation_loss_settings as get_distillation_loss_settings,
+)
+from verl.workers.utils.loss_context import LossContext
 from verl.workers.utils.losses import ppo_loss
 from verl.workers.utils.padding import no_padding_2_padding
 
@@ -43,33 +49,7 @@ def is_distillation_enabled(config: Optional[DistillationConfig]) -> bool:
     return config.enabled
 
 
-@dataclass
-class DistillationLossSettings(BaseConfig):
-    """
-    Settings for a distillation loss function to be registered.
-
-    Args:
-        names (str | list[str]): Name(s) to register the distillation loss function under.
-        use_topk (bool): Whether the loss function uses top-k log probabilities.
-        use_estimator (bool): Whether the loss function uses single-sample KL estimators.
-    """
-
-    names: str | list[str] = field(default_factory=list)
-    use_topk: bool = False
-    use_estimator: bool = False
-
-    _mutable_fields = {"names"}
-
-    def __post_init__(self):
-        self.names = [self.names] if isinstance(self.names, str) else self.names
-        if sum([self.use_topk, self.use_estimator]) != 1:
-            raise ValueError(
-                f"Expected only one of use_estimator, use_topk, but got {self.use_estimator=}, {self.use_topk=}."
-            )
-
-
 DISTILLATION_LOSS_REGISTRY: dict[str, DistillationLossFn] = {}
-DISTILLATION_SETTINGS_REGISTRY: dict[str, DistillationLossSettings] = {}
 
 
 def register_distillation_loss(
@@ -95,15 +75,6 @@ def get_distillation_loss_fn(loss_name: str) -> DistillationLossFn:
             f"Unsupported loss mode: {loss_name}. Supported modes are: {list(DISTILLATION_LOSS_REGISTRY.keys())}"
         )
     return DISTILLATION_LOSS_REGISTRY[loss_name]
-
-
-def get_distillation_loss_settings(loss_name: str) -> DistillationLossSettings:
-    """Get the distillation loss settings with a given name."""
-    if loss_name not in DISTILLATION_SETTINGS_REGISTRY:
-        raise ValueError(
-            f"Unsupported loss mode: {loss_name}. Supported modes are: {list(DISTILLATION_SETTINGS_REGISTRY.keys())}"
-        )
-    return DISTILLATION_SETTINGS_REGISTRY[loss_name]
 
 
 def compute_distillation_loss_range(
@@ -212,7 +183,8 @@ def distillation_ppo_loss(
         policy_loss = 0.0
         policy_metrics = {}
     else:
-        policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
+        local_config = LossContext.from_batch(data, config).bind_legacy_config(config)
+        policy_loss, policy_metrics = ppo_loss(local_config, model_output, data, dp_group)
         if not distillation_loss_config.use_task_rewards:
             policy_loss = 0.0
 
@@ -242,6 +214,15 @@ def distillation_loss(
     """
     assert distillation_config is not None
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
+    context = LossContext.from_batch(data, config)
+    if loss_config.loss_settings.payload_kind == "hidden":
+        if config.loss_agg_mode != "token-mean":
+            raise ValueError("full_reverse_kl requires token-mean aggregation")
+        loss = context.normalize_token_sum(model_output["full_kl_sum"])
+        # Upstream Metric.aggregate_dp averages ranks and sums micro-batches.
+        return loss, {"distillation/full_kl": Metric("sum", loss.detach())}
+    config = context.bind_legacy_config(config)
+    loss_config = context.bind_legacy_config(loss_config)
     distillation_loss_fn = get_distillation_loss_fn(loss_config.loss_mode)
     distillation_losses, distillation_metrics = distillation_loss_fn(
         config=config,
@@ -300,6 +281,11 @@ def distillation_loss(
         )
 
     return distillation_loss, distillation_metrics
+
+
+@register_distillation_loss(DistillationLossSettings(names="full_reverse_kl", payload_kind="hidden"))
+def compute_full_reverse_kl(config, distillation_config, model_output, data):
+    raise RuntimeError("full_reverse_kl must use the head callback, not a sampled estimator")
 
 
 @register_distillation_loss(DistillationLossSettings(names=["forward_kl_topk"], use_topk=True))  # type: ignore[arg-type]

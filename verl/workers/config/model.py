@@ -134,6 +134,7 @@ class HFModelConfig(BaseConfig):
     # path to pre-trained LoRA adapter to load for continued training
     lora_adapter_path: Optional[str] = None
     use_liger: bool = False
+    enable_full_vocab: bool = False
 
     use_fused_kernels: bool = False
     fused_kernel_options: dict = field(default_factory=dict)

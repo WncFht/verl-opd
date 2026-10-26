@@ -20,6 +20,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from functools import partial
 from pprint import pprint
 from typing import Any, Optional
@@ -85,7 +86,7 @@ from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.skip import SkipManager
 from verl.utils.tracking import DapoFilteredRewardTableLogger, Tracking, ValidationGenerationsLogger
-from verl.workers.config import CriticConfig, DistillationConfig, HFModelConfig
+from verl.workers.config import CriticConfig, HFModelConfig
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, TrainingWorkerConfig
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
 from verl.workers.utils.losses import value_loss
@@ -225,9 +226,18 @@ class PPOTrainer(ABC):
         self.on_init_end()
 
     def _setup(self):
+        self.shared_teacher_wg = None
+        self.distillation_config = (
+            omega_conf_to_dataclass(self.config.distillation) if self.use_teacher_policy else None
+        )
+        if self.distillation_config is not None:
+            self.distillation_config.validate_shared_sync(
+                self.config, use_reference_policy=self.use_reference_policy, use_critic=self.use_critic
+            )
         self._init_tokenizer()
         self._init_dataloader()
         self._init_dump_executor()
+        shared_teacher_config = self._make_shared_teacher_config() if self._uses_shared_teacher() else None
         self._init_resource_pool_mgr()
         self.resource_pool_manager.create_resource_pool()
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
@@ -252,6 +262,10 @@ class PPOTrainer(ABC):
             role=str(actor_role),
         )
         self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = actor_rollout_cls
+        if shared_teacher_config is not None:
+            self.resource_pool_to_cls[actor_rollout_resource_pool][str(Role.TeacherModel)] = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.TeacherModel], config=shared_teacher_config
+            )
 
         if actor_role == Role.Actor and self.use_reference_policy and not self.ref_in_actor:
             ref_resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
@@ -329,6 +343,10 @@ class PPOTrainer(ABC):
         self.actor_rollout_wg = all_wg[str(actor_role)]
         self.actor_rollout_wg.init_model()
         logger.info("actor and ref model engine initialized")
+        if shared_teacher_config is not None:
+            self.shared_teacher_wg = all_wg[str(Role.TeacherModel)]
+            # reset() initializes and offloads before student vLLM allocates its cache.
+            self.shared_teacher_wg.reset()
 
         if self.use_reference_policy and not self.ref_in_actor:
             if actor_role == Role.Actor:
@@ -352,16 +370,13 @@ class PPOTrainer(ABC):
         logger.info("reward loop manager initialized")
 
         # 8. initialize teacher loop manager
-        if self.use_teacher_policy:
+        self.teacher_model_manager = None
+        if self.use_teacher_policy and not self._uses_shared_teacher():
             teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
             self.teacher_model_manager = MultiTeacherModelManager(
                 config=self.config,
                 resource_pool=teacher_resource_pool,
             )
-            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
-        else:
-            self.teacher_model_manager = None
-            self.distillation_config = None
 
         # 9. initialize agent loop manager
         # Trainers that opt out of colocated rollout replicas on the training
@@ -404,7 +419,7 @@ class PPOTrainer(ABC):
         Returns:
             dict[str, LLMServerClient]: The teacher server clients.
         """
-        return self.teacher_model_manager.get_client() if self.use_teacher_policy else None
+        return self.teacher_model_manager.get_client() if self.teacher_model_manager is not None else None
 
     def get_reward_handles(self) -> list[ray.actor.ActorHandle]:
         """Get the handles of reward loop workers."""
@@ -581,10 +596,13 @@ class PPOTrainer(ABC):
 
         # 3. balance batch across data parallel groups
         batch = self._balance_batch(batch, metrics=metrics)
+        if self._uses_shared_teacher():
+            batch = self._compute_shared_teacher_log_probs(batch, timing_raw)
 
         # 4. compute old_log_prob
-        with marked_timer("old_log_prob", timing_raw, color="blue"):
-            batch = self._compute_old_log_prob(batch, metrics=metrics)
+        if not self._uses_full_vocab():
+            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                batch = self._compute_old_log_prob(batch, metrics=metrics)
 
         # 5. [OPTIONAL] compute ref_log_prob
         if self.use_reference_policy:
@@ -597,8 +615,9 @@ class PPOTrainer(ABC):
                 batch = self._compute_values(batch, metrics=metrics)
 
         # 7. compute advantage and return
-        with marked_timer("adv", timing_raw, color="brown"):
-            batch = self._compute_advantage(batch, metrics=metrics)
+        if not self._uses_full_vocab():
+            with marked_timer("adv", timing_raw, color="brown"):
+                batch = self._compute_advantage(batch, metrics=metrics)
 
         # 8. [OPTIONAL] update critic
         if self.use_critic:
@@ -702,6 +721,22 @@ class PPOTrainer(ABC):
     def _init_tokenizer(self):
         """Initialize tokenizer and processor from the model config."""
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.actor_rollout_ref.model)
+        if self._uses_shared_teacher():
+            self._validate_shared_model(model_config)
+        if self._uses_full_vocab():
+            actor = self.config.actor_rollout_ref.actor
+            if (
+                actor.strategy != "fsdp2"
+                or actor.loss_agg_mode != "token-mean"
+                or actor.use_kl_loss
+                or actor.entropy_coeff != 0
+                or self.config.algorithm.use_kl_in_reward
+                or self.config.actor_rollout_ref.rollout.temperature != 1.0
+                or self.use_critic
+            ):
+                raise ValueError(
+                    "full_reverse_kl requires FSDP2 token-mean, temperature=1, no critic or auxiliary rewards"
+                )
         self.tokenizer = model_config.tokenizer
         # Used for multimodal LLM, could be None
         self.processor = model_config.processor
@@ -836,7 +871,10 @@ class PPOTrainer(ABC):
             self.mapping[Role.RewardModel] = "global_pool"
 
         distillation_config = config.get("distillation")
-        if is_distillation_enabled(distillation_config):
+        if self._uses_shared_teacher():
+            self.role_worker_mapping[Role.TeacherModel] = ray.remote(TrainingWorker)
+            self.mapping[Role.TeacherModel] = global_pool_id
+        elif is_distillation_enabled(distillation_config):
             if distillation_config.n_gpus_per_node <= 0:
                 raise ValueError("config.distillation.n_gpus_per_node must be greater than 0")
             if distillation_config.nnodes <= 0:
@@ -1827,6 +1865,8 @@ class PPOTrainer(ABC):
 
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the actor network."""
+        if self._uses_full_vocab():
+            batch.fields = ["input_ids", "position_ids", "loss_mask", "response_mask", "prompts", "responses"]
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
@@ -1850,6 +1890,11 @@ class PPOTrainer(ABC):
         )
         extra_info = {
             "calculate_entropy": calculate_entropy,
+            "full_vocab_train": self._uses_full_vocab(),
+            "retain_sample_identity": self._uses_full_vocab(),
+            "full_vocab_prefetch": OmegaConf.select(
+                self.config, "distillation.distillation_loss.full_vocab.prefetch", default=False
+            ),
             "distillation_use_topk": distillation_use_topk,
             "distillation_only": distillation_only,
             "score_centering": score_centering,
@@ -1996,6 +2041,67 @@ class PPOTrainer(ABC):
                 "training/off_policy/trajectory_staleness_worst/min": trajectory_staleness_worst.min(),
             }
         )
+
+    def _uses_shared_teacher(self) -> bool:
+        """Whether distillation scores are produced by the colocated FSDP worker."""
+        config = self.config.get("distillation")
+        return is_distillation_enabled(config) and config.get("execution_mode", "standalone") == "shared_sync"
+
+    def _uses_full_vocab(self) -> bool:
+        if not is_distillation_enabled(self.config.get("distillation")):
+            return False
+        from verl.workers.config.distillation_spec import get_distillation_loss_settings
+
+        mode = OmegaConf.select(self.config, "distillation.distillation_loss.loss_mode")
+        return mode is not None and get_distillation_loss_settings(mode).payload_kind == "hidden"
+
+    @staticmethod
+    def _validate_shared_model(model_config: HFModelConfig):
+        """Restrict shared engines to dense text models with compatible class patches."""
+        hf_config = model_config.hf_config
+        if (
+            any(getattr(hf_config, name, None) is not None for name in ("vision_config", "audio_config"))
+            or getattr(hf_config, "is_encoder_decoder", False)
+            or any(getattr(hf_config, name, 0) for name in ("num_local_experts", "num_experts", "n_routed_experts"))
+        ):
+            raise ValueError("shared_sync currently supports dense text models only")
+
+    def _make_shared_teacher_config(self) -> TrainingWorkerConfig:
+        """Construct an independent teacher model config without student cached state."""
+        teacher = next(iter(self.distillation_config.teacher_models.values()))
+        model_config = HFModelConfig(
+            path=teacher.model_path,
+            trust_remote_code=self.config.actor_rollout_ref.model.get("trust_remote_code", False),
+            use_remove_padding=True,
+            use_fused_kernels=False,
+            enable_gradient_checkpointing=False,
+            enable_activation_offload=False,
+            enable_full_vocab=self._uses_full_vocab(),
+        )
+        self._validate_shared_model(model_config)
+        if model_config.tokenizer.get_vocab() != self.tokenizer.get_vocab():
+            raise ValueError("shared_sync requires identical student/teacher token-to-ID vocabularies")
+        # The teacher scores the student's already-tokenized trajectory and masks;
+        # it neither renders prompts nor generates/stops/pads sequences. Different
+        # default special-token roles (e.g. Qwen3 Base vs Instruct EOS) are valid
+        # when every token has the same ID. Keep the vocabulary check above strict.
+        engine_config = replace(self.distillation_config.shared_teacher, fsdp_size=self.config.trainer.n_gpus_per_node)
+        return TrainingWorkerConfig(model_type="language_model", model_config=model_config, engine_config=engine_config)
+
+    def _compute_shared_teacher_log_probs(self, batch: KVBatchMeta, timing_raw: dict) -> KVBatchMeta:
+        from verl.trainer.distillation.shared_teacher import SharedTeacherScorer
+
+        scorer = SharedTeacherScorer(
+            self.shared_teacher_wg,
+            payload_kind="hidden" if self._uses_full_vocab() else "sampled",
+            async_write=OmegaConf.select(
+                self.config, "distillation.distillation_loss.full_vocab.async_write", default=False
+            ),
+            get=tq.kv_batch_get,
+            put=tq.kv_batch_put,
+            wait=ray.get,
+        )
+        return scorer.score(batch, timing_raw)
 
 
 TRAINER_REGISTRY: dict[str, type[PPOTrainer]] = {}

@@ -38,7 +38,7 @@ from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
-from verl.utils.device import get_device_id, get_device_name
+from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -333,6 +333,20 @@ class FSDPEngine(BaseEngine):
                 fused_kernels_backend=fused_kernels_backend,
             )
 
+            if self.model_config.enable_full_vocab:
+                from verl.models.transformers.full_vocab import install_full_vocab_adapter
+
+                if (
+                    self.ulysses_sequence_parallel_size != 1
+                    or self.engine_config.strategy != "fsdp2"
+                    or self.model_config.lora_rank > 0
+                    or use_fused_kernels
+                    or not self.use_remove_padding
+                    or self.pad_to_length
+                ):
+                    raise ValueError("full reverse KL requires FSDP2, SP=1, packed input, no LoRA/static pad/fused PPO")
+                install_full_vocab_adapter(module)
+
             # some parameters may not in torch_dtype
             module.to(torch_dtype)
 
@@ -460,7 +474,9 @@ class FSDPEngine(BaseEngine):
                 param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True
             )
             offload_policy = None
-            if self.engine_config.offload_policy or self.engine_config.forward_only:
+            if self.engine_config.offload_policy or (
+                self.engine_config.forward_only and self.engine_config.forward_only_cpu_offload
+            ):
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
                 offload_policy = CPUOffloadPolicy(pin_memory=True)
@@ -735,6 +751,8 @@ class FSDPEngine(BaseEngine):
         torch.distributed.all_reduce(
             batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
         )
+        if not forward_only and batch_num_tokens.item() == 0:
+            raise ValueError("Cannot train with zero globally valid response tokens")
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
@@ -750,32 +768,38 @@ class FSDPEngine(BaseEngine):
         # and _build_fsdp_module, so self.scaler may not be set.
         scaler = getattr(self, "scaler", None)
 
-        for micro_batch_idx, micro_batch in enumerate(micro_batches):
-            sync_ctx = (
-                nullcontext()
-                if forward_only
-                else self._gradient_sync_context(is_last_micro_batch=micro_batch_idx == len(micro_batches) - 1)
-            )
-            # Name each micro-batch in the trace. Without this a forward-only stage
-            # (compute_log_prob / compute_ref_log_prob) is a single row with anonymous forwards
-            # inside; here every micro-batch forward (and, when training, its backward) becomes a
-            # distinguishable "micro_batch<i>" row -- nested under the update loop's "mini_batch<i>"
-            # when training, or directly under the stage for log-prob.
-            with ctx, sync_ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
-                loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+        from verl.trainer.distillation.hidden_io import HiddenBatchIO
 
-                if not forward_only:
-                    if scaler is not None:
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
-                    if not return_model_output:
-                        # Standard training discards model_output (train_batch pops it); keeping it accumulates
-                        # full-length nested tensors across the mini-batch (∝ ppo_mini_batch * rollout_n) → OOM.
-                        # Specialized callers such as Tinker may opt in when their response requires these outputs.
-                        meta_info.pop("model_output", None)
+        with HiddenBatchIO(data, micro_batches) as hidden_io:
+            for micro_batch_idx, micro_batch in enumerate(hidden_io):
+                sync_ctx = (
+                    nullcontext()
+                    if forward_only
+                    else self._gradient_sync_context(is_last_micro_batch=micro_batch_idx == len(micro_batches) - 1)
+                )
+                # Name each micro-batch in the trace. Without this a forward-only stage
+                # (compute_log_prob / compute_ref_log_prob) is a single row with anonymous forwards
+                # inside; here every micro-batch forward (and, when training, its backward) becomes a
+                # distinguishable "micro_batch<i>" row -- nested under the update loop's "mini_batch<i>"
+                # when training, or directly under the stage for log-prob.
+                with ctx, sync_ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
+                    loss, meta_info = self.forward_step(
+                        micro_batch, loss_function=loss_function, forward_only=forward_only
+                    )
 
-            output_lst.append(meta_info)
+                    if not forward_only:
+                        if scaler is not None:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+                        if not return_model_output:
+                            # Standard training discards model_output (train_batch pops it); keeping it accumulates
+                            # full-length nested tensors across the mini-batch (∝ ppo_mini_batch * rollout_n) → OOM.
+                            # Specialized callers such as Tinker may opt in when their response requires these outputs.
+                            meta_info.pop("model_output", None)
+
+                hidden_io.publish(meta_info, micro_batch)
+                output_lst.append(meta_info)
 
         # postprocess and return
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
@@ -852,8 +876,13 @@ class FSDPEngine(BaseEngine):
         """
         super().to(device=device, model=model, optimizer=optimizer, grad=grad)
 
-        if self.engine_config.forward_only:
-            # force cpu_offload
+        phase_offload = (
+            self.engine_config.forward_only
+            and self.engine_config.strategy == "fsdp2"
+            and not self._uses_fsdp2_cpu_offload_policy
+        )
+        if self.engine_config.forward_only and not phase_offload:
+            # Reference policies retain automatic per-layer CPU offloading.
             return
 
         device_name = get_device_name()
@@ -871,6 +900,11 @@ class FSDPEngine(BaseEngine):
                 offload_fsdp_optimizer(self.optimizer)
         else:
             raise ValueError(f"Invalid device type: {device}")
+
+        if phase_offload:
+            # Phase RPC completion must include H2D completion (model.to is
+            # nonblocking). Do not change actor/ref transfer overlap semantics.
+            get_torch_device().synchronize()
 
     def save_checkpoint(
         self,
@@ -1570,7 +1604,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
         # actually, we should avoid assigning like this...
-        micro_batch = micro_batch.to(get_device_id())
+        full_vocab = tu.get_non_tensor_data(micro_batch, "full_vocab_teacher", default=False) or tu.get_non_tensor_data(
+            micro_batch, "full_vocab_train", default=False
+        )
+        if full_vocab:
+            from torch.profiler import record_function as full_kl_range
+
+            with full_kl_range("micro_batch_h2d"):
+                micro_batch = micro_batch.to(get_device_id())
+        else:
+            micro_batch = micro_batch.to(get_device_id())
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
         # Honor mixed_precision.param_dtype resolved during FSDP setup. When dtype is fp32,
@@ -1584,14 +1627,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
             else torch.autocast(device_type=device_name, dtype=autocast_dtype)
         )
         with autocast_ctx:
-            raw_output = self.module(
-                **model_inputs,
-                use_cache=False,
-            )  # prevent model thinks we are generating
-
-            model_output = self.prepare_model_outputs(
-                output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
-            )
+            full_teacher = tu.get_non_tensor_data(micro_batch, "full_vocab_teacher", default=False)
+            full_train = tu.get_non_tensor_data(micro_batch, "full_vocab_train", default=False)
+            if full_teacher or full_train:
+                model_output = self._full_vocab_output(micro_batch, model_inputs, teacher=full_teacher)
+            else:
+                raw_output = self.module(**model_inputs, use_cache=False)
+                model_output = self.prepare_model_outputs(
+                    output=raw_output,
+                    output_args=output_args,
+                    micro_batch=micro_batch,
+                    logits_processor_func=loss_function,
+                )
 
             if loss_function is not None:
                 loss, metrics = loss_function(
@@ -1604,12 +1651,73 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
             # Detach before this lands in forward_backward_batch's output_lst; see detach_tree.
             output = {
-                "model_output": detach_tree(model_output),
+                "model_output": {} if full_train else detach_tree(model_output),
                 "loss": loss.detach().item(),
                 "metrics": metrics,
             }
 
             return loss, output
+
+    def configure_full_vocab(self, config, teacher_path):
+        from verl.trainer.distillation.hidden import FrozenTeacherHead
+
+        self.full_vocab_config = config
+        self.full_vocab_teacher_head = FrozenTeacherHead(teacher_path)
+
+    def _full_vocab_output(self, micro_batch, model_inputs, teacher):
+        from torch.profiler import record_function as full_kl_range
+
+        from verl.trainer.distillation.full_vocab import full_reverse_kl
+        from verl.workers.utils.padding import prediction_positions
+
+        if not self.model_config.enable_full_vocab:
+            raise ValueError("full-vocab output requires the model head adapter")
+        if not _is_scalar_unit_temperature(tu.get(micro_batch, "temperature", 1.0)):
+            raise ValueError("full reverse KL currently requires temperature=1")
+        if any(
+            tu.get_non_tensor_data(micro_batch, key, default=False)
+            for key in ("calculate_entropy", "calculate_sum_pi_squared", "score_centering")
+        ):
+            raise ValueError("full reverse KL does not enable sampled-policy diagnostics or entropy objectives")
+        positions, packed = prediction_positions(micro_batch["input_ids"], micro_batch["loss_mask"])
+
+        def output(hidden, head):
+            selected = hidden.squeeze(0).index_select(0, packed)
+            if teacher:
+                # Free each micro-batch GPU result instead of retaining the full batch there.
+                with full_kl_range("teacher_hidden_d2h"):
+                    chunks = selected.detach().cpu().split([len(p) for p in positions])
+                return {
+                    "teacher_hidden": torch.nested.as_nested_tensor(list(chunks), layout=torch.jagged),
+                    "teacher_positions": torch.nested.as_nested_tensor(
+                        [p.cpu() for p in positions], layout=torch.jagged
+                    ),
+                }
+            actual_positions = micro_batch["teacher_positions"]
+            if any(not torch.equal(a, b) for a, b in zip(positions, actual_positions.unbind(), strict=True)):
+                raise ValueError("Teacher hidden prediction positions do not match student loss mask")
+            teacher_hidden = micro_batch["teacher_hidden"].values()
+            with full_kl_range("teacher_head_get"):
+                weight = self.full_vocab_teacher_head.get(selected.device, selected.dtype)
+            config = self.full_vocab_config
+
+            def compute(h, w):
+                with torch.autocast(device_type=h.device.type, enabled=False):
+                    return full_reverse_kl(
+                        h,
+                        w.to(h.dtype),
+                        teacher_hidden.to(h.dtype),
+                        weight,
+                        token_chunk=config.token_chunk_size,
+                    )
+
+            # Calling the wrapped head is required for its FSDP2 all-gather/backward hooks.
+            with full_kl_range("head_loss"):
+                result = head(selected, full_vocab_callback=compute)
+            return {"full_kl_sum": result, "full_kl_count": packed.numel()}
+
+        with full_kl_range("teacher_forward" if teacher else "student_forward"):
+            return self.module(**model_inputs, use_cache=False, full_vocab_callback=output)
 
 
 @EngineRegistry.register(model_type="value_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])

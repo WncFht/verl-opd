@@ -93,17 +93,17 @@ class EngineConfig(BaseConfig):
     # whether the engine is forward only (e.g., ref policy)
     forward_only: bool = False
     # the strategy (backend)
-    strategy: str = None
+    strategy: Optional[str] = None
     # model dtype
     dtype: str = "bfloat16"  # ["bfloat16", "float16"]
     # whether to use dynamic bsz
     use_dynamic_bsz: bool = True
     # for training
-    max_token_len_per_gpu: int = None
-    micro_batch_size_per_gpu: int = None
+    max_token_len_per_gpu: Optional[int] = None
+    micro_batch_size_per_gpu: Optional[int] = None
     # for inference
-    infer_max_token_len_per_gpu: int = None
-    infer_micro_batch_size_per_gpu: int = None
+    infer_max_token_len_per_gpu: Optional[int] = None
+    infer_micro_batch_size_per_gpu: Optional[int] = None
     # whether use fuse lm head kernel
     use_fused_kernels: bool = False
     # TODO (this may conflict with the one in model config)
@@ -276,6 +276,7 @@ class FSDPEngineConfig(EngineConfig):
     # fsdp specific flags
     wrap_policy: dict[str, Any] = field(default_factory=dict)
     offload_policy: bool = False
+    forward_only_cpu_offload: bool = True
     reshard_after_forward: bool = True
     fsdp_size: int = -1
     forward_prefetch: bool = False

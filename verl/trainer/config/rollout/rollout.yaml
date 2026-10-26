@@ -157,6 +157,7 @@ engine_kwargs:
 
 # Sampling parameters used during validation.
 val_kwargs:
+  max_tokens: null
 
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.SamplingConfig

@@ -56,6 +56,7 @@ lora_adapter_path: null
 
 # whether to use liger. Only valid when we use hf model definition
 use_liger: False
+enable_full_vocab: false
 
 # whether to use fused kernels.
 use_fused_kernels: False

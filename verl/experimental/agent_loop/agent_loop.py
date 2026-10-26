@@ -277,6 +277,7 @@ class AgentLoopBase(ABC):
         # default builder (or default VL builder with a multimodal processor).
         self.continuous_token_builder = create_continuous_token_builder(
             self.tokenizer,
+            model_family=self.data_config.get("continuous_token", {}).get("model_family", "auto"),
             hf_model_type=hf_model_type,
             chat_template_kwargs=self.apply_chat_template_kwargs,
             mm_processor_kwargs=self.mm_processor_kwargs,
@@ -543,7 +544,8 @@ class AgentLoopWorker:
 
         # Online policy distillation
         self.distillation_enabled = is_distillation_enabled(config.distillation)
-        if self.distillation_enabled:
+        self.teacher_server_manager = None
+        if self.distillation_enabled and config.distillation.get("execution_mode", "standalone") == "standalone":
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 
             self.teacher_key: str = config.distillation.teacher_key
@@ -636,6 +638,8 @@ class AgentLoopWorker:
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["top_k"] = config.val_kwargs.top_k
             sampling_params["temperature"] = config.val_kwargs.temperature
+            if config.val_kwargs.get("max_tokens") is not None:
+                sampling_params["max_tokens"] = config.val_kwargs.max_tokens
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
@@ -788,16 +792,19 @@ class AgentLoopWorker:
             return_attention_mask=True,
         )
 
+        response_length = self.rollout_config.response_length
+        if validate:
+            response_length = self.rollout_config.get("val_kwargs", {}).get("max_tokens") or response_length
         response_output = self._pad_token_ids(
             output.response_ids,
-            max_length=self.rollout_config.response_length,
+            max_length=response_length,
             padding_side="right",
             return_attention_mask=True,
         )
 
         response_mask_output = self._pad_token_ids(
             output.response_mask,
-            max_length=self.rollout_config.response_length,
+            max_length=response_length,
             padding_side="right",
             return_attention_mask=False,
         )
@@ -1068,7 +1075,7 @@ class AgentLoopWorker:
         sample_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
         """Compute teacher logprobs for single sample."""
-        if self.distillation_enabled and not validate:
+        if self.teacher_server_manager is not None and not validate:
             routing_key = None
             if sample_kwargs is not None:
                 routing_value = sample_kwargs.get(self.teacher_key)

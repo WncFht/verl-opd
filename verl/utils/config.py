@@ -131,6 +131,12 @@ def validate_config(
         use_reference_policy (bool): is ref policy needed
         use_critic (bool): is critic needed
     """
+    distillation = config.get("distillation")
+    if distillation and distillation.get("enabled", False) and distillation.get("execution_mode") == "shared_sync":
+        omega_conf_to_dataclass(distillation).validate_shared_sync(
+            config, use_reference_policy=use_reference_policy, use_critic=use_critic
+        )
+
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
