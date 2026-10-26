@@ -1,3 +1,5 @@
+> This branch adds shared-sync OPD and exact full-vocabulary reverse KL on verl `263653e7`. See [usage and validation status](examples/opd_full_vocab/README.md).
+
 <div align="center">
  👋 Hi, everyone!
     verl is a RL training library initiated by <b>ByteDance Seed team</b> and maintained by the verl community.
